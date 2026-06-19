@@ -1,0 +1,7 @@
+# mambo-hachimi 自动签到 - Python 依赖
+# Python 3.9+
+# 安装：pip install -r requirements.txt
+# 安装后还需执行一次：sbase get chromedriver   （SeleniumBase 会自动管理，一般无需手动）
+
+seleniumbase>=4.28.0     # UC Mode（Undetected Chrome），用于通过 Cloudflare Turnstile
+python-dotenv>=1.0.0     # 从 .env 读取凭据

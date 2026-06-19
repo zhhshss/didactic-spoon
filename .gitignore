@@ -1,0 +1,18 @@
+# 凭据与本地数据，绝不提交
+.env
+.profile/
+profiles/
+downloaded_files/
+latest_logs/
+*.log
+
+# 截图与临时
+screenshots/
+*.png
+.playwright-mcp/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
