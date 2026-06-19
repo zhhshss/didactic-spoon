@@ -28,6 +28,7 @@ mambo-hachimi.biliblili.uk 自动签到脚本
 import os
 import sys
 import json
+import base64
 import time
 import logging
 from pathlib import Path
@@ -55,9 +56,21 @@ BASE_URL = os.getenv("MAMBO_BASE_URL", "https://mambo-hachimi.biliblili.uk").rst
 USERNAME = os.getenv("MAMBO_USERNAME", "")
 PASSWORD = os.getenv("MAMBO_PASSWORD", "")
 
+# 可选：直接注入的登录令牌（JWT）。优先级高于 .profile 与本地 token 文件，
+# 适合首次 bootstrap 或跨机器复用：本机用 `python checkin.py --export-token`
+# 导出后配进 GitHub Secret（MAMBO_AUTH_TOKEN），云端首跑即可免登录。
+AUTH_TOKEN = os.getenv("MAMBO_AUTH_TOKEN", "").strip()
+
 # 持久化浏览器数据目录：保留 localStorage(auth_token) 与 cf_clearance，
 # 让第二次以后的运行尽量免登录、免验证。
 USER_DATA_DIR = os.getenv("MAMBO_PROFILE_DIR", str(Path(__file__).resolve().parent / ".profile"))
+
+# 登录令牌的独立落盘文件（放在持久化目录内，随 .profile 一起被 actions/cache 复用）。
+# 为什么需要它：Chromium 的 localStorage(leveldb) 是【异步批量落盘】的，UC 浏览器
+# 在签到完成后快速退出时，auth_token 常来不及 flush 进磁盘 —— 于是缓存恢复后读不到，
+# 被迫每次重新登录（还会触发登录提醒邮件）。故由脚本在浏览器【仍存活】时主动把 token
+# 读出写入此文件，落盘确定、不依赖浏览器退出 flush，下次启动注入即可跳过登录。
+TOKEN_FILE = Path(USER_DATA_DIR) / ".mambo_auth_token"
 
 # 显示模式：
 #   有桌面环境 → 设 MAMBO_DISPLAY=headed（弹出真实窗口，最稳）
@@ -186,8 +199,86 @@ def is_logged_in(sb):
     return ok
 
 
+# ============================================================
+# 登录令牌的本地持久化（绕开 leveldb 异步落盘的不确定性）
+# ============================================================
+def load_token():
+    """从独立文件读取上次保存的 auth_token（不存在或失败则返回空串）。"""
+    try:
+        return TOKEN_FILE.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return ""
+    except Exception as e:
+        log.debug(f"读取 token 文件失败（忽略）：{e}")
+        return ""
+
+
+def save_token(sb):
+    """把当前 localStorage 里的 auth_token 主动落盘到独立文件。
+
+    必须在浏览器仍停留于本站、且已登录时调用。此举不依赖浏览器退出 flush，
+    确保下次运行（缓存恢复后）能稳定读回 token，免去反复登录。内容未变则不写盘。
+    """
+    try:
+        token = sb.execute_script(
+            "return localStorage.getItem('auth_token') || sessionStorage.getItem('auth_token');"
+        )
+    except Exception as e:
+        log.debug(f"读取 localStorage token 失败（忽略）：{e}")
+        return
+    if not token or token == load_token():
+        return
+    try:
+        TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
+        TOKEN_FILE.write_text(token, encoding="utf-8")
+        log.info("已保存登录令牌到本地（供下次免登录复用）")
+    except Exception as e:
+        log.debug(f"写入 token 文件失败（忽略）：{e}")
+
+
+def token_expired(token):
+    """纯本地解码 JWT 的 exp 判断是否已过期（不验签，仅用于省去一次无效注入）。
+
+    解析失败一律返回 False —— 交由实际注入 + 业务校验兜底，绝不阻断流程。
+    """
+    try:
+        payload = token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        exp = json.loads(base64.urlsafe_b64decode(payload)).get("exp")
+        return bool(exp) and exp <= time.time()
+    except Exception:
+        return False
+
+
+def inject_token(sb, token):
+    """把 token 写进 localStorage 绕过登录，并以登录态校验是否生效。
+
+    需已停留在本站同源页面。校验走 /api/auth/me（直接读 localStorage 发请求），
+    故注入后无需刷新页面即可判定。
+    """
+    if not token or token_expired(token):
+        if token:
+            log.info("待注入的令牌已过期，跳过注入")
+        return False
+    try:
+        sb.execute_script(
+            "localStorage.setItem('auth_token', arguments[0]);"
+            "try{sessionStorage.setItem('auth_token', arguments[0]);}catch(e){}",
+            token,
+        )
+    except Exception as e:
+        log.debug(f"注入 token 失败：{e}")
+        return False
+    return is_logged_in(sb)
+
+
 def do_login(sb):
     """打开 /login，填表单 → 过 Turnstile → 等前端自动提交并写入 auth_token。"""
+    if not (USERNAME and PASSWORD):
+        raise RuntimeError(
+            "无法登录：未配置账号密码。请设置 MAMBO_USERNAME / MAMBO_PASSWORD，"
+            "或提供有效的 MAMBO_AUTH_TOKEN / 本地 token 文件以免登录复用。"
+        )
     log.info("开始登录流程…")
     sb.uc_open_with_reconnect(f"{BASE_URL}/login", reconnect_time=4)
     sb.sleep(1.5)
@@ -325,8 +416,11 @@ def build_sb_kwargs():
 
 
 def main():
-    if not USERNAME or not PASSWORD:
-        sys.exit("未配置凭据：请在 .env 中设置 MAMBO_USERNAME / MAMBO_PASSWORD")
+    if not AUTH_TOKEN and not load_token() and not (USERNAME and PASSWORD):
+        sys.exit(
+            "未配置凭据：请设置 MAMBO_AUTH_TOKEN（推荐云端），"
+            "或 MAMBO_USERNAME / MAMBO_PASSWORD"
+        )
 
     log.info(f"目标站点：{BASE_URL}")
     log.info(f"持久化目录：{USER_DATA_DIR}")
@@ -336,11 +430,20 @@ def main():
         sb.uc_open_with_reconnect(f"{BASE_URL}/", reconnect_time=4)
         sb.sleep(1.5)
 
-        # 1) 登录态
-        if not is_logged_in(sb):
-            do_login(sb)
-        else:
+        # 1) 登录态：三层兜底，尽量免登录
+        #    ① .profile 里的登录态仍有效 → 直接复用（最理想）
+        #    ② 注入令牌（Secret/env 优先，否则本地 token 文件）→ 免登录跳过
+        #    ③ 都不行 → 账密登录（会触发登录提醒邮件）
+        if is_logged_in(sb):
             log.info("复用已保存的登录态，跳过登录")
+        elif inject_token(sb, AUTH_TOKEN or load_token()):
+            log.info("已注入持久化登录令牌，跳过登录 ✓")
+        else:
+            do_login(sb)
+
+        # 登录态已确定有效 → 主动把最新令牌落盘，供下次免登录复用
+        # （关键：不依赖浏览器退出时的 leveldb flush，从根上消除反复登录）
+        save_token(sb)
 
         # 2) 是否已签到（幂等）
         checked, status = get_checkin_status(sb)
@@ -355,11 +458,57 @@ def main():
         log.info("全部完成 ✓ 喵～")
 
 
+def export_token():
+    """读取当前 .profile 的 auth_token 并打印，便于配置到 GitHub Secret（MAMBO_AUTH_TOKEN）。
+
+    用于首次 bootstrap 或令牌过期后刷新：在【有效登录态】的本机执行，
+    把令牌喂给云端，云端首跑即可免登录。
+    """
+    log.info(f"目标站点：{BASE_URL}")
+    log.info(f"持久化目录：{USER_DATA_DIR}")
+    with SB(**build_sb_kwargs()) as sb:
+        sb.uc_open_with_reconnect(f"{BASE_URL}/", reconnect_time=4)
+        sb.sleep(1.5)
+        if not is_logged_in(sb):
+            sys.exit(
+                "当前 .profile 未处于登录态，无法导出令牌。\n"
+                "请先在有桌面环境登录一次（MAMBO_DISPLAY=headed python checkin.py），成功后再导出。"
+            )
+        token = sb.execute_script(
+            "return localStorage.getItem('auth_token') || sessionStorage.getItem('auth_token');"
+        )
+        if not token:
+            sys.exit("登录态有效但未读到 auth_token（站点可能改用 cookie 鉴权），无法导出。")
+        save_token(sb)  # 顺便落盘，与正常运行保持一致
+
+    print("\n" + "=" * 64)
+    print("登录令牌 auth_token（请妥善保管，等同账号密码，切勿外泄）：")
+    print("=" * 64)
+    print(token)
+    print("=" * 64)
+    # 解码过期时间，提示何时需要重新导出刷新 Secret
+    try:
+        payload = token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        exp = json.loads(base64.urlsafe_b64decode(payload)).get("exp")
+        if exp:
+            exp_dt = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(exp))
+            left = (exp - time.time()) / 86400
+            print(f"过期时间：{exp_dt}（约 {left:.1f} 天后；过期后需重新导出并更新 Secret）")
+    except Exception:
+        pass
+    print("\n配置方法：仓库 Settings → Secrets and variables → Actions → New repository secret")
+    print("  名称：MAMBO_AUTH_TOKEN     值：上面那串令牌\n")
+
+
 if __name__ == "__main__":
     try:
-        main()
+        if len(sys.argv) > 1 and sys.argv[1] in ("--export-token", "export-token"):
+            export_token()
+        else:
+            main()
     except KeyboardInterrupt:
         sys.exit("\n已手动中断")
     except Exception as exc:
-        log.error(f"签到失败：{exc}")
+        log.error(f"操作失败：{exc}")
         sys.exit(1)

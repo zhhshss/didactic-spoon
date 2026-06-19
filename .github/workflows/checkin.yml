@@ -3,13 +3,16 @@
 # ------------------------------------------------------------
 # ⚠️ 使用前必读：
 #   1) 到仓库 Settings → Secrets and variables → Actions → New secret
-#      添加两个仓库机密：MAMBO_USERNAME / MAMBO_PASSWORD（你的账号密码）
+#      添加账号机密：MAMBO_USERNAME / MAMBO_PASSWORD（你的账号密码）
 #
-#   2) 本站登录/签到都有 Cloudflare Turnstile 人机验证，而 README 已指出
-#      「数据中心 IP 成功率低」——GitHub runner 正是机房 IP，故【需要登录时】
-#      很可能过不了验证。强烈建议：先在本机用 headed 模式跑一次登录刷新
-#      .profile/，让登录态被下方缓存复用；之后只要 auth_token 未过期，
-#      Action 即可跳过最难的登录环节直接签到，成功率显著更高。
+#   2) 登录态持久化（避免每次重新登录、避免反复收到登录提醒邮件）：
+#      脚本会把登录令牌 auth_token 主动写入 .profile/.mambo_auth_token，
+#      再由下方 actions/cache 跨运行复用。Chromium 的 localStorage 是异步落盘的，
+#      仅靠浏览器缓存常 flush 不及时导致令牌丢失、被迫反复登录；改由脚本主动落盘后，
+#      只要令牌未过期（站点 JWT 约 7 天）后续运行都【免登录】直接签到，
+#      令牌自然过期才自动重登一次刷新。
+#      （可选）想连首次登录都省掉：本机跑 `python checkin.py --export-token`
+#      导出令牌，配成仓库机密『MAMBO_AUTH_TOKEN』即可。
 #
 #   3) 脚本是幂等的：已签到会立即退出，重复运行安全无副作用。
 # ============================================================
@@ -67,6 +70,7 @@ jobs:
         env:
           MAMBO_USERNAME: ${{ secrets.MAMBO_USERNAME }}
           MAMBO_PASSWORD: ${{ secrets.MAMBO_PASSWORD }}
+          MAMBO_AUTH_TOKEN: ${{ secrets.MAMBO_AUTH_TOKEN }}   # 可选：免登录令牌；未配置则为空，自动回退账密
           MAMBO_DISPLAY: xvfb   # 无桌面 runner：用虚拟显示，让 UC 仍可做 GUI 点击
         run: python checkin.py
 
