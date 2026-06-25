@@ -70,9 +70,10 @@ jobs:
         env:
           MAMBO_USERNAME: ${{ secrets.MAMBO_USERNAME }}
           MAMBO_PASSWORD: ${{ secrets.MAMBO_PASSWORD }}
-          MAMBO_AUTH_TOKEN: ${{ secrets.MAMBO_AUTH_TOKEN }}   # 可选：免登录令牌；未配置则为空，自动回退账密
-          MAMBO_DISPLAY: xvfb   # 无桌面 runner：用虚拟显示，让 UC 仍可做 GUI 点击
-        run: python checkin.py
+          MAMBO_AUTH_TOKEN: ${{ secrets.MAMBO_AUTH_TOKEN }}
+          MAMBO_DISPLAY: xvfb
+        # 【重点修正】：使用 xvfb-run 动态分配虚拟屏幕并执行脚本
+        run: xvfb-run --auto-servernum python checkin.py
 
       - name: 保存持久化浏览器 profile
         if: always()            # 即便签到失败也保存，尽量留住已刷新的登录态供下次复用
